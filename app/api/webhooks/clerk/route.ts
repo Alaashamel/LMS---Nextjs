@@ -1,206 +1,164 @@
-import { headers } from "next/headers";
-import { NextResponse } from "next/server";
+import { createClient } from "@sanity/client";
 import { Webhook } from "svix";
-import { writeClient } from "@/sanity/lib/write-client";
+import { NextResponse } from "next/server";
 
-type ClerkUserData = {
-    id: string;
-    email_addresses: Array<{ email_address: string; id: string }>;
-    primary_email_address_id: string;
-    first_name: string | null;
-    last_name: string | null;
-    image_url: string;
-    public_metadata: Record<string, unknown>;
+export const runtime = "nodejs";
+
+type ClerkEmailAddress = {
+  id?: string;
+  email_address?: string;
 };
 
-type ClerkSubscriptionData = {
-    id: string;
-    user_id?: string;
-    userId?: string;
-    status: string;
-    plan?: {
-        id?: string;
-        key?: string;
-        slug?: string;
-        name?: string;
-    };
-    plan_key?: string;
-    plan_id?: string;
+type ClerkWebhookUser = {
+  id: string;
+  email_addresses?: ClerkEmailAddress[];
+  primary_email_address_id?: string | null;
+  first_name?: string | null;
+  last_name?: string | null;
+  username?: string | null;
+  image_url?: string | null;
+  profile_image_url?: string | null;
 };
 
-type WebhookEvent = {
-    type: string;
-    data: ClerkUserData | ClerkSubscriptionData;
+type ClerkWebhookEvent = {
+  type: string;
+  data: ClerkWebhookUser;
 };
 
-function getPrimaryEmail(userData: ClerkUserData): string {
-    const primary = userData.email_addresses?.find(
-        (e) => e.id === userData.primary_email_address_id
-    );
-    return primary?.email_address ?? userData.email_addresses?.[0]?.email_address ?? "";
+const sanityClient = createClient({
+  projectId: process.env.NEXT_PUBLIC_SANITY_PROJECT_ID || "",
+  dataset: process.env.NEXT_PUBLIC_SANITY_DATASET || "production",
+  apiVersion: process.env.NEXT_PUBLIC_SANITY_API_VERSION || "2025-01-01",
+  token: process.env.SANITY_API_TOKEN || "",
+  useCdn: false,
+});
+
+function getPrimaryEmail(data: ClerkWebhookUser): string {
+  const emails = Array.isArray(data.email_addresses)
+    ? data.email_addresses
+    : [];
+
+  const primaryEmail = emails.find(
+    (email) => email.id === data.primary_email_address_id
+  );
+
+  return (
+    primaryEmail?.email_address ||
+    emails[0]?.email_address ||
+    `${data.id}@placeholder.local`
+  );
 }
 
-function getFullName(userData: ClerkUserData): string {
-    const parts = [userData.first_name, userData.last_name].filter(Boolean);
-    return parts.join(" ");
-}
+function getFullName(data: ClerkWebhookUser): string {
+  const firstName = data.first_name || "";
+  const lastName = data.last_name || "";
+  const fullName = `${firstName} ${lastName}`.trim();
 
-// Map Clerk plan key/slug to our tier values
-function resolvePlan(planKey: string | null | undefined): "free" | "pro" | "ultra" {
-    if (!planKey) return "free";
-    const lower = planKey.toLowerCase();
-    if (lower.includes("ultra")) return "ultra";
-    if (lower.includes("pro")) return "pro";
-    return "free";
-}
-
-async function upsertUser(
-    clerkId: string,
-    fields: Partial<{
-        email: string;
-        name: string;
-        imageUrl: string;
-        plan: "free" | "pro" | "ultra";
-        subscriptionStatus: string;
-        subscriptionId: string;
-        planUpdatedAt: string;
-    }>
-) {
-    const docId = `clerk_${clerkId}`;
-
-    await writeClient
-        .transaction()
-        .createIfNotExists({
-            _id: docId,
-            _type: "user",
-            clerkId,
-            plan: "free",
-            subscriptionStatus: "none",
-        })
-        .patch(docId, (p) => p.set(fields))
-        .commit();
+  return fullName || data.username || "New Learner";
 }
 
 export async function POST(req: Request) {
-    const webhookSecret = process.env.CLERK_WEBHOOK_SECRET;
+  const secret =
+    process.env.CLERK_WEBHOOK_SECRET ||
+    process.env.CLERK_WEBHOOK_SIGNING_SECRET;
 
-    if (!webhookSecret) {
-        console.error("CLERK_WEBHOOK_SECRET is not set");
-        return NextResponse.json({ error: "Webhook secret not configured" }, { status: 500 });
+  if (!secret) {
+    return NextResponse.json(
+      { error: "Missing Clerk webhook secret" },
+      { status: 500 }
+    );
+  }
+
+  if (!process.env.SANITY_API_TOKEN) {
+    return NextResponse.json(
+      { error: "Missing Sanity API token" },
+      { status: 500 }
+    );
+  }
+
+  const svixId = req.headers.get("svix-id");
+  const svixTimestamp = req.headers.get("svix-timestamp");
+  const svixSignature = req.headers.get("svix-signature");
+
+  if (!svixId || !svixTimestamp || !svixSignature) {
+    return NextResponse.json(
+      { error: "Missing Svix headers" },
+      { status: 400 }
+    );
+  }
+
+  const payload = await req.text();
+
+  let event: ClerkWebhookEvent;
+
+  try {
+    const webhook = new Webhook(secret);
+
+    event = webhook.verify(payload, {
+      "svix-id": svixId,
+      "svix-timestamp": svixTimestamp,
+      "svix-signature": svixSignature,
+    }) as ClerkWebhookEvent;
+  } catch (error) {
+    console.error("Webhook verification failed:", error);
+
+    return NextResponse.json(
+      { error: "Invalid webhook signature" },
+      { status: 401 }
+    );
+  }
+
+  const eventType = event.type;
+  const data = event.data;
+
+  try {
+    if (eventType === "user.created" || eventType === "user.updated") {
+      const email = getPrimaryEmail(data);
+      const name = getFullName(data);
+
+      await sanityClient.createOrReplace({
+        _id: `user-${data.id}`,
+        _type: "user",
+        clerkId: data.id,
+        email,
+        name,
+        imageUrl: data.image_url || data.profile_image_url || "",
+        plan: "free",
+        subscriptionStatus: "inactive",
+        updatedAt: new Date().toISOString(),
+      });
+
+      return NextResponse.json({
+        success: true,
+        type: eventType,
+        userId: data.id,
+      });
     }
 
-    const headerPayload = await headers();
-    const svixId = headerPayload.get("svix-id");
-    const svixTimestamp = headerPayload.get("svix-timestamp");
-    const svixSignature = headerPayload.get("svix-signature");
+    if (eventType === "user.deleted") {
+      await sanityClient.delete(`user-${data.id}`).catch(() => null);
 
-    if (!svixId || !svixTimestamp || !svixSignature) {
-        return NextResponse.json({ error: "Missing svix headers" }, { status: 400 });
+      return NextResponse.json({
+        success: true,
+        type: eventType,
+        userId: data.id,
+      });
     }
 
-    const payload = await req.text();
+    return NextResponse.json({
+      success: true,
+      ignored: true,
+      type: eventType,
+    });
+  } catch (error) {
+    console.error("Webhook handler failed:", error);
 
-    const wh = new Webhook(webhookSecret);
-    let event: WebhookEvent;
-
-    try {
-        event = wh.verify(payload, {
-            "svix-id": svixId,
-            "svix-timestamp": svixTimestamp,
-            "svix-signature": svixSignature,
-        }) as WebhookEvent;
-    } catch (err) {
-        console.error("Webhook verification failed:", err);
-        return NextResponse.json({ error: "Invalid webhook signature" }, { status: 400 });
-    }
-
-    const { type, data } = event;
-    console.log(`[Clerk Webhook] Event received: ${type}`);
-
-    try {
-        // ── User created ──────────────────────────────────────────────────────────
-        if (type === "user.created") {
-            const user = data as ClerkUserData;
-            await upsertUser(user.id, {
-                email: getPrimaryEmail(user),
-                name: getFullName(user),
-                imageUrl: user.image_url,
-                plan: "free",
-                subscriptionStatus: "none",
-            });
-            console.log(`[Clerk Webhook] Created user ${user.id} in Sanity`);
-        }
-
-        // ── User updated (name/email change, or plan metadata change) ─────────────
-        if (type === "user.updated") {
-            const user = data as ClerkUserData;
-            await upsertUser(user.id, {
-                email: getPrimaryEmail(user),
-                name: getFullName(user),
-                imageUrl: user.image_url,
-            });
-            console.log(`[Clerk Webhook] Updated user ${user.id} in Sanity`);
-        }
-
-        // ── Subscription created ──────────────────────────────────────────────────
-        if (type === "subscription.created") {
-            const sub = data as ClerkSubscriptionData;
-            const userId = sub.user_id ?? sub.userId ?? "";
-            const planKey = sub.plan?.key ?? sub.plan?.slug ?? sub.plan_key ?? "";
-            const plan = resolvePlan(planKey);
-
-            await upsertUser(userId, {
-                plan,
-                subscriptionStatus: sub.status ?? "active",
-                subscriptionId: sub.id,
-                planUpdatedAt: new Date().toISOString(),
-            });
-            console.log(`[Clerk Webhook] Subscription created for ${userId} → plan: ${plan}`);
-        }
-
-        // ── Subscription updated (upgrade / downgrade) ────────────────────────────
-        if (type === "subscription.updated") {
-            const sub = data as ClerkSubscriptionData;
-            const userId = sub.user_id ?? sub.userId ?? "";
-            const planKey = sub.plan?.key ?? sub.plan?.slug ?? sub.plan_key ?? "";
-            const plan = resolvePlan(planKey);
-
-            await upsertUser(userId, {
-                plan,
-                subscriptionStatus: sub.status ?? "active",
-                subscriptionId: sub.id,
-                planUpdatedAt: new Date().toISOString(),
-            });
-            console.log(`[Clerk Webhook] Subscription updated for ${userId} → plan: ${plan}`);
-        }
-
-        // ── Subscription past due ─────────────────────────────────────────────────
-        if (type === "subscription.pastDue") {
-            const sub = data as ClerkSubscriptionData;
-            const userId = sub.user_id ?? sub.userId ?? "";
-            await upsertUser(userId, {
-                subscriptionStatus: "past_due",
-                planUpdatedAt: new Date().toISOString(),
-            });
-            console.log(`[Clerk Webhook] Subscription past due for ${userId}`);
-        }
-
-        // ── Subscription item canceled / ended → downgrade to free ────────────────
-        if (type === "subscriptionItem.canceled" || type === "subscriptionItem.ended") {
-            const sub = data as ClerkSubscriptionData;
-            const userId = sub.user_id ?? sub.userId ?? "";
-            await upsertUser(userId, {
-                plan: "free",
-                subscriptionStatus: "canceled",
-                subscriptionId: sub.id,
-                planUpdatedAt: new Date().toISOString(),
-            });
-            console.log(`[Clerk Webhook] ${type} for ${userId} → downgraded to free`);
-        }
-
-        return NextResponse.json({ received: true });
-    } catch (err) {
-        console.error("[Clerk Webhook] Error processing event:", err);
-        return NextResponse.json({ error: "Internal server error" }, { status: 500 });
-    }
+    return NextResponse.json(
+      {
+        error: "Webhook handler failed",
+        details: error instanceof Error ? error.message : "Unknown error",
+      },
+      { status: 500 }
+    );
+  }
 }
