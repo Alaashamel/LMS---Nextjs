@@ -1,6 +1,6 @@
 # LMS Next.js Platform
 # try from here => 
-https://lms-nextjs-peach.vercel.app/
+[https://lms-nextjs-peach.vercel.app/](https://lms-nextjs-frnovm5x0-genious-projects.vercel.app/)
 
 A modern learning management platform with course pages, admin areas, Sanity Studio, Mux upload route structure, Clerk auth, and analytics pages.
 
