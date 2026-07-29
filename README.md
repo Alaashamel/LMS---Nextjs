@@ -1,4 +1,7 @@
 # LMS Next.js Platform
+
+![License](https://img.shields.io/badge/license-MIT-blue.svg) ![Language](https://img.shields.io/badge/language-TypeScript-informational.svg) ![Last Commit](https://img.shields.io/github/last-commit/Alaashamel/LMS---Nextjs)
+
 # try from here => 
 [https://lms-nextjs-peach.vercel.app/](https://lms-nextjs-frnovm5x0-genious-projects.vercel.app/)
 
